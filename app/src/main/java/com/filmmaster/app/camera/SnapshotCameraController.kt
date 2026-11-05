@@ -1,0 +1,312 @@
+package com.filmmaster.app.camera
+
+import android.content.Context
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
+import android.view.Surface
+import androidx.camera.camera2.interop.Camera2CameraInfo
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
+import java.io.File
+import java.util.concurrent.TimeUnit
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.suspendCancellableCoroutine
+
+/**
+ * 抓拍模式相机控制器（CameraX + Camera2Interop）。
+ *
+ * 关键约束：Camera2 只有在 CONTROL_AE_MODE == OFF 时才会采用 SENSOR_EXPOSURE_TIME，
+ * 因此抓拍模式的 ImageCapture 固定 AE 关闭、手动曝光时间与 ISO（快门优先）。
+ * ISO 由预览 AE 的最新结果按“保持曝光量”换算得到：ISO_new = ISO_ae * T_ae / T_target。
+ *
+ * AE/AF 锁定：曝光由固定值天然锁定；AF 在连拍前触发一次中心区域对焦，
+ * 连拍期间使用 CONTINUOUS_PICTURE，不再反复触发对焦。
+ *
+ * 说明：这是 MVP 的顺序连拍实现（每次 takePicture 等 JPEG 落盘），
+ * 真正的 60fps 环形缓冲需要 ImageReader burst，将在后续迭代加入。
+ */
+class SnapshotCameraController(
+    private val context: Context,
+    private val lifecycleOwner: LifecycleOwner
+) {
+
+    data class ExposureReadout(
+        val shutterNs: Long = 0L,
+        val iso: Int = 0,
+        val locked: Boolean = false,
+        val degraded: Boolean = false
+    )
+
+    private val mainExecutor = ContextCompat.getMainExecutor(context)
+    private val _readout = MutableStateFlow(ExposureReadout())
+    val readout: StateFlow<ExposureReadout> = _readout.asStateFlow()
+
+    private var provider: ProcessCameraProvider? = null
+    private var preview: Preview? = null
+    private var imageCapture: ImageCapture? = null
+    private var camera: Camera? = null
+    private var previewView: PreviewView? = null
+
+    private var snapshotEnabled = false
+
+    /** 期望快门（纳秒），默认 1/125s。 */
+    private var targetExposureNs = 1_000_000_000L / 125
+
+    /** 用户手动指定 ISO；null 表示自动换算。 */
+    private var isoOverride: Int? = null
+
+    private var exposureRange: android.util.Range<Long>? = null
+    private var isoRange: android.util.Range<Int>? = null
+
+    @Volatile private var latestAeExposureNs: Long? = null
+    @Volatile private var latestAeIso: Int? = null
+
+    /** 预览会话回调：持续读取 AE 的实际曝光时间与 ISO，用于实时显示与 ISO 换算。 */
+    private val aeCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(
+            session: CameraCaptureSession,
+            request: CaptureRequest,
+            result: TotalCaptureResult
+        ) {
+            val exp = result.get(CaptureResult.SENSOR_EXPOSURE_TIME)
+            val iso = result.get(CaptureResult.SENSOR_SENSITIVITY)
+            if (exp != null && iso != null && exp > 0 && iso > 0) {
+                latestAeExposureNs = exp
+                latestAeIso = iso
+                if (!snapshotEnabled) {
+                    _readout.value = ExposureReadout(exp, iso, locked = false, degraded = false)
+                }
+            }
+        }
+    }
+
+    fun bind(previewView: PreviewView, onError: (Throwable) -> Unit) {
+        this.previewView = previewView
+        val future = ProcessCameraProvider.getInstance(context)
+        future.addListener({
+            try {
+                val cameraProvider = future.get()
+                provider = cameraProvider
+
+                val previewBuilder = Preview.Builder()
+                Camera2Interop.Extender(previewBuilder)
+                    .setSessionCaptureCallback(aeCallback)
+                val previewUseCase = previewBuilder.build().also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+                preview = previewUseCase
+
+                bindUseCases(cameraProvider)
+            } catch (t: Throwable) {
+                onError(t)
+            }
+        }, mainExecutor)
+    }
+
+    fun unbind() {
+        provider?.unbindAll()
+        provider = null
+        camera = null
+        preview = null
+        imageCapture = null
+    }
+
+    /** 切换抓拍模式；必须在主线程调用（会重建 ImageCapture 并重绑）。 */
+    fun setSnapshotEnabled(enabled: Boolean) {
+        if (snapshotEnabled == enabled) return
+        val previous = snapshotEnabled
+        snapshotEnabled = enabled
+        try {
+            provider?.let { bindUseCases(it) }
+        } catch (t: Throwable) {
+            // 重绑失败（例如设备拒绝 AE_MODE_OFF）→ 回退到普通模式
+            snapshotEnabled = previous
+            runCatching { provider?.let { bindUseCases(it) } }
+            throw t
+        }
+    }
+
+    /** 设置快门优先的曝光时间，例如 denominator=125 表示 1/125s。 */
+    fun setShutterDenominator(denominator: Int) {
+        if (denominator <= 0) return
+        targetExposureNs = 1_000_000_000L / denominator
+        if (snapshotEnabled) provider?.let { bindUseCases(it) }
+    }
+
+    /** 手动指定 ISO；传 null 恢复自动换算。 */
+    fun setIsoOverride(iso: Int?) {
+        isoOverride = iso
+        if (snapshotEnabled) provider?.let { bindUseCases(it) }
+    }
+
+    /** 顺序连拍 [count] 张，返回实际落盘的临时 JPEG 列表（至少 1 张）。 */
+    suspend fun captureBurst(count: Int = 4): List<File> {
+        val capture = imageCapture ?: throw IllegalStateException("相机尚未就绪")
+        focusAndWait()
+
+        val files = ArrayList<File>(count)
+        var lastError: Throwable? = null
+        repeat(count) { index ->
+            try {
+                files += takePictureOnce(capture, index)
+            } catch (t: Throwable) {
+                lastError = t
+            }
+        }
+        if (files.isEmpty()) {
+            throw lastError ?: IllegalStateException("连拍失败")
+        }
+        return files
+    }
+
+    /** 普通模式单张拍摄（不触发对焦，保持 M1 的低延迟行为）。 */
+    suspend fun captureSingle(): File {
+        val capture = imageCapture ?: throw IllegalStateException("相机尚未就绪")
+        return takePictureOnce(capture, 0)
+    }
+
+    private fun bindUseCases(cameraProvider: ProcessCameraProvider) {
+        val (exposureNs, iso, degraded) = computeFixedExposure()
+
+        val captureBuilder = ImageCapture.Builder()
+            .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setTargetRotation(Surface.ROTATION_0)
+
+        if (snapshotEnabled) {
+            Camera2Interop.Extender(captureBuilder)
+                .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AE_MODE,
+                    CaptureRequest.CONTROL_AE_MODE_OFF
+                )
+                .setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
+                .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
+                // 连拍期间不主动触发 AF 扫描，避免焦点拉扯
+                .setCaptureRequestOption(
+                    CaptureRequest.CONTROL_AF_MODE,
+                    CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE
+                )
+        }
+
+        val capture = captureBuilder.build()
+
+        val previewUseCase = preview ?: return
+        cameraProvider.unbindAll()
+        camera = cameraProvider.bindToLifecycle(
+            lifecycleOwner,
+            CameraSelector.DEFAULT_BACK_CAMERA,
+            previewUseCase,
+            capture
+        )
+        imageCapture = capture
+
+        camera?.let { readCharacteristics(it) }
+
+        _readout.value = ExposureReadout(
+            shutterNs = if (snapshotEnabled) exposureNs else _readout.value.shutterNs,
+            iso = if (snapshotEnabled) iso else _readout.value.iso,
+            locked = snapshotEnabled,
+            degraded = snapshotEnabled && degraded
+        )
+    }
+
+    private fun computeFixedExposure(): Triple<Long, Int, Boolean> {
+        val range = exposureRange
+        var degraded = false
+        var exposureNs = targetExposureNs
+        if (range != null && exposureNs < range.lower) {
+            exposureNs = range.lower
+            degraded = true
+        } else if (range != null && exposureNs > range.upper) {
+            exposureNs = range.upper
+        }
+
+        val aeIso = latestAeIso
+        val aeExp = latestAeExposureNs
+        var iso = isoOverride ?: when {
+            aeIso != null && aeExp != null && aeExp > 0 ->
+                (aeIso.toDouble() * aeExp / exposureNs).toInt()
+            else -> 3200
+        }
+
+        isoRange?.let { iso = iso.coerceIn(it.lower, it.upper) }
+        iso = iso.coerceIn(MIN_ISO, MAX_AUTO_ISO)
+
+        if (iso >= MAX_AUTO_ISO) degraded = true
+        return Triple(exposureNs, iso, degraded)
+    }
+
+    private fun readCharacteristics(camera: Camera) {
+        runCatching {
+            val info = Camera2CameraInfo.from(camera.cameraInfo)
+            exposureRange = info.getCameraCharacteristic(
+                CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE
+            )
+            isoRange = info.getCameraCharacteristic(
+                CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE
+            )
+        }
+    }
+
+    private suspend fun focusAndWait() {
+        val cam = camera ?: return
+        val view = previewView ?: return
+        if (view.width <= 0 || view.height <= 0) return
+        val point = view.meteringPointFactory.createPoint(
+            view.width / 2f, view.height / 2f
+        )
+        val action = FocusMeteringAction
+            .Builder(point, FocusMeteringAction.FLAG_AF or FocusMeteringAction.FLAG_AE)
+            .setAutoCancelDuration(300, TimeUnit.MILLISECONDS)
+            .build()
+        runCatching { cam.cameraControl.startFocusAndMetering(action) }
+        delay(120)
+    }
+
+    private suspend fun takePictureOnce(capture: ImageCapture, index: Int): File =
+        suspendCancellableCoroutine { continuation ->
+            val stamp = System.currentTimeMillis()
+            val file = File(context.cacheDir, "snapshot_${stamp}_$index.jpg")
+            val options = ImageCapture.OutputFileOptions.Builder(file).build()
+
+            continuation.invokeOnCancellation { file.delete() }
+
+            capture.takePicture(
+                options,
+                mainExecutor,
+                object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                        if (continuation.isActive) continuation.resume(file)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        file.delete()
+                        if (continuation.isActive) {
+                            continuation.resumeWithException(exception)
+                        }
+                    }
+                }
+            )
+        }
+
+    private companion object {
+        const val MIN_ISO = 100
+        const val MAX_AUTO_ISO = 6400
+    }
+}

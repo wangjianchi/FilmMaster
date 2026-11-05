@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">FilmMaster</string>
+    <string name="permission_required">需要相机权限才能开始拍摄</string>
+    <string name="grant_permission">授予权限</string>
+</resources>
