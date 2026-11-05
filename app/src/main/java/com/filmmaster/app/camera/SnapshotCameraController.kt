@@ -1,25 +1,31 @@
 package com.filmmaster.app.camera
 
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Matrix
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.TotalCaptureResult
+import android.util.Size
 import android.view.Surface
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.Camera2Interop
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
+import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import java.io.File
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -30,6 +36,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * 抓拍模式相机控制器（CameraX + Camera2Interop）。
@@ -65,8 +72,21 @@ class SnapshotCameraController(
     private var imageCapture: ImageCapture? = null
     private var camera: Camera? = null
     private var previewView: PreviewView? = null
+    private var analysis: ImageAnalysis? = null
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
 
     private var snapshotEnabled = false
+
+    /** 设备是否支持 RAW（决定 UI 是否显示 RAW 开关）。 */
+    @Volatile var supportsRaw: Boolean = false
+        private set
+
+    private var previewGradingEnabled = false
+    @Volatile private var previewGrader: ((Bitmap) -> Bitmap)? = null
+    private var frameCounter = 0
+
+    private val _gradedPreview = MutableStateFlow<Bitmap?>(null)
+    val gradedPreview: StateFlow<Bitmap?> = _gradedPreview.asStateFlow()
 
     /** 快门候选（分母），从快到慢；在保证不欠曝的前提下选最快的一个。 */
     private val shutterCandidates = intArrayOf(125, 100, 80, 60, 50, 40, 30, 25, 20)
@@ -130,11 +150,36 @@ class SnapshotCameraController(
     }
 
     fun unbind() {
+        analysis?.clearAnalyzer()
+        analysis = null
         provider?.unbindAll()
         provider = null
         camera = null
         preview = null
         imageCapture = null
+        _gradedPreview.value = null
+    }
+
+    /** 开关半分辨率预览分级（会重建 ImageCapture + ImageAnalysis 并重绑）。 */
+    fun setPreviewGrading(enabled: Boolean, grader: ((Bitmap) -> Bitmap)?) {
+        previewGrader = grader
+        if (previewGradingEnabled == enabled) return
+        previewGradingEnabled = enabled
+        if (!enabled) _gradedPreview.value = null
+        provider?.let { bindUseCases(it) }
+    }
+
+    /** 开关 RAW（仅设备支持且非抓拍模式时生效）。 */
+    suspend fun captureRawThenRebind(rawCapture: RawDngCapture): android.net.Uri? {
+        val view = previewView ?: return null
+        unbind()
+        val uri = runCatching { rawCapture.capture() }.getOrNull()
+        bind(view) { }
+        // 等待 CameraX 重新就绪，避免紧接着的 JPEG 拍摄落空
+        withTimeoutOrNull(3000L) {
+            while (imageCapture == null) delay(30)
+        }
+        return uri
     }
 
     /** 切换抓拍模式；必须在主线程调用（会重建 ImageCapture 并重绑）。 */
@@ -223,12 +268,27 @@ class SnapshotCameraController(
         val capture = captureBuilder.build()
 
         val previewUseCase = preview ?: return
+        analysis?.clearAnalyzer()
+        analysis = null
+
+        val useCases = mutableListOf<androidx.camera.core.UseCase>(previewUseCase, capture)
+        if (previewGradingEnabled) {
+            val analysisUseCase = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                .setTargetResolution(Size(640, 480))
+                .setTargetRotation(Surface.ROTATION_0)
+                .build()
+                .also { it.setAnalyzer(analysisExecutor, ::analyzeFrame) }
+            analysis = analysisUseCase
+            useCases += analysisUseCase
+        }
+
         cameraProvider.unbindAll()
         camera = cameraProvider.bindToLifecycle(
             lifecycleOwner,
             CameraSelector.DEFAULT_BACK_CAMERA,
-            previewUseCase,
-            capture
+            *useCases.toTypedArray()
         )
         imageCapture = capture
         appliedShutterNs = exposureNs
@@ -306,6 +366,40 @@ class SnapshotCameraController(
             isoRange = camera2Info.getCameraCharacteristic(
                 CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE
             )
+            val capabilities = camera2Info.getCameraCharacteristic(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES
+            )
+            supportsRaw = capabilities?.any {
+                it == CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW
+            } == true
+        }
+    }
+
+    /** 预览帧 → 半分辨率分级。抽帧到约 10fps，避免 CPU 分级拖慢取景。 */
+    private fun analyzeFrame(proxy: ImageProxy) {
+        try {
+            val grader = previewGrader
+            if (!previewGradingEnabled || grader == null) return
+            frameCounter++
+            if (frameCounter % PREVIEW_FRAME_STRIDE != 0) return
+
+            val raw = proxy.toBitmap()
+            val rotation = proxy.imageInfo.rotationDegrees
+            val rotated = if (rotation == 0) {
+                raw
+            } else {
+                Bitmap.createBitmap(
+                    raw, 0, 0, raw.width, raw.height,
+                    Matrix().apply { postRotate(rotation.toFloat()) }, true
+                ).also { raw.recycle() }
+            }
+            val graded = grader(rotated)
+            if (graded !== rotated && !rotated.isRecycled) rotated.recycle()
+            _gradedPreview.value = graded
+        } catch (_: Throwable) {
+            // 预览分级失败不影响拍摄，静默丢弃该帧
+        } finally {
+            proxy.close()
         }
     }
 
@@ -353,5 +447,6 @@ class SnapshotCameraController(
     private companion object {
         const val MIN_ISO = 100
         const val MAX_AUTO_ISO = 6400
+        const val PREVIEW_FRAME_STRIDE = 3
     }
 }

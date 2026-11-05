@@ -1,21 +1,25 @@
-# FilmMaster — Android 影像 App（M1）
+# FilmMaster — Android 影像 App（M4）
 
-一个独立实现的 Android 相机 + 3D LUT 影像应用，对标"大师模式"的核心体验：
-实时取景、胶片风格 Look、强度控制、RAW/高位深管线（M2 起）。
+一个独立实现的 Android 相机 + 胶片风格影像应用，对标"大师模式"的核心体验：
+实时取景、胶片风格 Look、强度控制、线性高位深管线、抓拍多帧合成、Auto / Pro 与配方系统。
 
 > 本项目不逆向、不提取任何厂商（OPPO / 哈苏等）的闭源代码、私有 LUT 或 ISP 算法。
 > 内置风格 LUT 全部由公开的影调/色彩数学**程序化生成**（`ProceduralLuts.kt`）。
 
-## M1 已完成
+## 已完成（M1–M4）
 
 - CameraX 实时预览（`PreviewView` + `Preview`）
 - JPEG 拍照（`ImageCapture`，全分辨率）
-- 成片后 GPU 3D LUT（离屏 EGL + GLES3 `sampler3D`，双线性/三线性硬件插值）
+- 成片后 GPU 3D LUT（离屏 EGL + GLES3 `sampler3D`，硬件三线性插值）
 - 强度滑杆（`mix(原图, LUT 结果, strength)`）
 - 3 个程序化胶片风格：琥珀 400 / 冷调 250 / 褪色 100
 - EXIF 方向校正、保存到系统相册 `Pictures/FilmMaster`
 - 无 GLES3 / EGL 失败时自动降级到 CPU 三线性 LUT 路径
 - 单元测试：`.cube` 解析、三线性采样、强度/Alpha、程序化 LUT 合法性
+- **M2**：线性高位深成片管线（sRGB → 线性 → 曲线 → 编码 → LUT），RAW 能力探测与 JPEG+RAW 采集
+- **M3**：参数化胶片曲线（对比 / 伽马 / 黑位 / 高光压缩）、GPU 颗粒与暗角、半分辨率分级预览
+- **M4**：Auto / Pro 双模式、配方 JSON 本地保存与 SAF 导入导出、成片水印
+- **抓拍模式**：固定短曝光连拍 4 帧 → 平移对齐 + 中值合成 → 线性曲线 / LUT → USM / Clarity
 
 ## 构建
 
@@ -72,32 +76,43 @@ CameraX ImageCapture ──► cacheDir/*.jpg
 
 | 文件 | 职责 |
 | --- | --- |
-| `camera/CameraController.kt` | CameraX 绑定、拍照 |
+| `camera/SnapshotCameraController.kt` | CameraX 绑定、拍照、抓拍连拍、RAW、分级预览帧 |
+| `camera/CameraController.kt` | M1 遗留的普通相机封装（未接入 UI） |
 | `lut/Lut3D.kt` | LUT 数据结构、`.cube` 解析、三线性采样、CPU 应用 |
 | `lut/ProceduralLuts.kt` | 3 个程序化胶片风格 |
+| `color/ColorMath.kt` | sRGB ↔ 线性光转换 |
+| `pipeline/ToneCurve.kt` | 参数化胶片曲线（线性光，预烘焙 1D 表） |
+| `pipeline/LinearColorPipeline.kt` | M2 线性高位深成片管线 |
+| `pipeline/PreviewGrader.kt` | M3 半分辨率预览分级 |
+| `pipeline/MultiFrameProcessor.kt` | 抓拍对齐 + 中值合成 |
+| `pipeline/FrameEnhancer.kt` | USM / Clarity / 颗粒 |
+| `recipe/Recipe.kt` | M4 配方模型与 JSON 序列化 |
+| `recipe/RecipeStore.kt` | 配方持久化与 SAF 导入导出 |
 | `gl/EglCore.kt` | 离屏 EGL（GLES3 优先，ES2 降级） |
-| `gl/LutGlProcessor.kt` | 3D LUT shader + FBO + 回读 |
-| `image/PhotoSaver.kt` | EXIF 方向、MediaStore 保存 |
-| `ui/CameraScreen.kt` | 取景 UI、风格/强度、拍摄流程 |
+| `gl/LutGlProcessor.kt` | 3D LUT + 颗粒 / 暗角 shader + FBO 回读 |
+| `image/PhotoSaver.kt` | EXIF 方向、水印、MediaStore 保存 |
+| `ui/CameraScreen.kt` | Auto / Pro UI、风格、抓拍、配方操作 |
+| `ui/Controls.kt` | Pro 面板滑杆组件 |
 
-M1 中 LUT 在**显示参考 sRGB 空间**查表（成片后处理）；M2 会改为线性高位深管线，
-把 LUT 放到正确的管线位置（线性化 → 色彩引擎 → 编码）。
+M2 起，影调曲线在**线性光**下计算（float，预烘焙 1D 表），3D LUT 仍保持
+“显示参考”语义并放在曲线之后，因此现有 `.cube` 资源无需改写即可继续使用。
 
-## 已知限制（M1）
+## 已知限制（M1–M4）
 
-- 预览为相机直通，尚未套用 LUT；预览分级（半分辨率 LUT+曲线）在 M2/M3 实现。
-- 仅 JPEG 输入；RAW/DNG 与线性化在 M2。
-- 全分辨率 GPU 处理受 `GL_MAX_TEXTURE_SIZE` 限制，超出时自动降采样（会在 M5 改为分块处理）。
-- 锁定竖屏，`targetRotation` 固定 0，简化 M1 的方向处理。
-- 不做人脸/场景识别，不做多帧合成。
+- 普通取景仍是相机直通；“分级预览”是 360px 半分辨率、约 10fps 的近似预览，仅供构图参考。
+- RAW 只做**采集**：CameraX 的 ImageCapture 不支持 RAW 输出，因此开启 RAW 时会临时释放 CameraX、用 Camera2 + `DngCreator` 拍一张 DNG 写入 `Pictures/FilmMaster/RAW`，再重绑并拍摄 JPEG。DNG 解码 / 去马赛克留到 M5，线性管线当前处理 JPEG。
+- 配方只保存创作参数，不含 ISO / 快门等硬件状态。
+- 全分辨率 GPU 处理受 `GL_MAX_TEXTURE_SIZE` 限制，超出时自动降采样（M5 计划改为分块处理）。
+- 锁定竖屏，`targetRotation` 固定 0。
+- 未做人脸/场景识别；抓拍为顺序连拍 + 平移对齐，非 60fps 环形缓冲。
 - `minSdk = 29`：依赖 MediaStore `RELATIVE_PATH / IS_PENDING`，暂不提供旧系统兼容分支。
 
 ## 路线图
 
-- **M2**：Camera2/CameraX RAW 能力 + DNG 线性化（`DngCreator` 读取/解码），线性空间 ColorPipeline 接口。
-- **M3**：参数化胶片曲线 + 颗粒/暗角 shader，预览半分辨率分级管线。
-- **M4**：Auto / Pro UI，配方 JSON 序列化 + 导入导出 + 水印。
-- **M5**：多风格 LUT（`.cube` 资源 + 生成脚本）、完整测试、README 完善。
+- ~~M2：线性空间 ColorPipeline + RAW 能力 / 采集~~
+- ~~M3：参数化胶片曲线 + 颗粒/暗角 shader + 半分辨率分级预览~~
+- ~~M4：Auto / Pro UI + 配方 JSON 导入导出 + 水印~~
+- **M5**：多风格 LUT（`.cube` 资源 + 生成脚本）、DNG 解码、完整测试、分块 GPU 处理。
 
 ## 许可与声明
 

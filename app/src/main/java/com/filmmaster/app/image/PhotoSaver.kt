@@ -4,7 +4,9 @@ import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
+import android.graphics.Canvas
 import android.graphics.Matrix
+import android.graphics.Paint
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.exifinterface.media.ExifInterface
@@ -53,10 +55,18 @@ object PhotoSaver {
             }
     }
 
-    /** 保存到系统相册 Pictures/FilmMaster，返回 MediaStore Uri。 */
-    fun saveToGallery(context: Context, bitmap: Bitmap, quality: Int = 95): Uri {
+    /** 保存到系统相册 Pictures/FilmMaster，返回 MediaStore Uri。水印为空时不拷贝原图。 */
+    fun saveToGallery(
+        context: Context,
+        bitmap: Bitmap,
+        quality: Int = 95,
+        watermark: String? = null
+    ): Uri {
         val resolver = context.contentResolver
         val name = "FM_${SimpleDateFormat("yyyyMMdd_HHmmss_SSS", Locale.US).format(Date())}.jpg"
+        val output = watermark?.takeIf { it.isNotBlank() }
+            ?.let { drawWatermark(bitmap, it) }
+            ?: bitmap
 
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)
@@ -70,7 +80,7 @@ object PhotoSaver {
 
         try {
             resolver.openOutputStream(uri)?.use { stream ->
-                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, stream)) {
+                if (!output.compress(Bitmap.CompressFormat.JPEG, quality, stream)) {
                     throw IllegalStateException("JPEG 编码失败")
                 }
             } ?: throw IllegalStateException("无法打开输出流")
@@ -83,6 +93,31 @@ object PhotoSaver {
         } catch (t: Throwable) {
             resolver.delete(uri, null, null)
             throw t
+        } finally {
+            if (output !== bitmap) output.recycle()
         }
+    }
+
+    /** 右下角半透明水印，边距与字号按短边比例缩放。 */
+    private fun drawWatermark(source: Bitmap, text: String): Bitmap {
+        val copy = source.copy(Bitmap.Config.ARGB_8888, true)
+        val shortSide = minOf(copy.width, copy.height)
+        val textSize = (shortSide / 24f).coerceAtLeast(14f)
+        val margin = textSize * 0.8f
+
+        val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+            color = android.graphics.Color.WHITE
+            alpha = 170
+            this.textSize = textSize
+            setShadowLayer(textSize / 8f, 0f, textSize / 12f, 0x99000000)
+        }
+        val canvas = Canvas(copy)
+        canvas.drawText(
+            text,
+            copy.width - margin - paint.measureText(text),
+            copy.height - margin,
+            paint
+        )
+        return copy
     }
 }

@@ -19,14 +19,28 @@ import java.nio.FloatBuffer
  */
 class LutGlProcessor {
 
-    fun process(src: Bitmap, lut: Lut3D, strength: Float): Bitmap {
-        val gpu = runCatching { processGpu(src, lut, strength) }
+    fun process(
+        src: Bitmap,
+        lut: Lut3D,
+        strength: Float,
+        grain: Float = 0f,
+        vignette: Float = 0f,
+        seed: Int = 0
+    ): Bitmap {
+        val gpu = runCatching { processGpu(src, lut, strength, grain, vignette, seed) }
         gpu.getOrNull()?.let { return it }
         Log.w(TAG, "GPU LUT path failed, falling back to CPU: ${gpu.exceptionOrNull()?.message}")
-        return processCpu(src, lut, strength)
+        return processCpu(src, lut, strength, grain, vignette, seed)
     }
 
-    private fun processGpu(src: Bitmap, lut: Lut3D, strength: Float): Bitmap {
+    private fun processGpu(
+        src: Bitmap,
+        lut: Lut3D,
+        strength: Float,
+        grain: Float,
+        vignette: Float,
+        seed: Int
+    ): Bitmap {
         val egl = EglCore()
         check(egl.init()) { "EGL init failed" }
         if (egl.glVersion < 3) {
@@ -140,6 +154,18 @@ class LutGlProcessor {
                 GLES30.glGetUniformLocation(program, "uStrength"),
                 strength.coerceIn(0f, 1f)
             )
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uGrain"),
+                grain.coerceIn(0f, 1f)
+            )
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uVignette"),
+                vignette.coerceIn(0f, 1f)
+            )
+            GLES30.glUniform1f(
+                GLES30.glGetUniformLocation(program, "uSeed"),
+                seed.toFloat()
+            )
 
             GLES30.glViewport(0, 0, width, height)
             GLES30.glClearColor(0f, 0f, 0f, 1f)
@@ -170,13 +196,65 @@ class LutGlProcessor {
         }
     }
 
-    private fun processCpu(src: Bitmap, lut: Lut3D, strength: Float): Bitmap {
+    private fun processCpu(
+        src: Bitmap,
+        lut: Lut3D,
+        strength: Float,
+        grain: Float,
+        vignette: Float,
+        seed: Int
+    ): Bitmap {
         val width = src.width
         val height = src.height
         val pixels = IntArray(width * height)
         src.getPixels(pixels, 0, width, 0, 0, width, height)
         val graded = lut.applyArgb(pixels, strength)
+        if (grain <= 0f && vignette <= 0f) {
+            return Bitmap.createBitmap(graded, width, height, Bitmap.Config.ARGB_8888)
+        }
+
+        val cx = width / 2f
+        val cy = height / 2f
+        val maxRadius = kotlin.math.sqrt(cx * cx + cy * cy)
+        for (i in graded.indices) {
+            val p = graded[i]
+            var r = (p shr 16) and 0xFF
+            var g = (p shr 8) and 0xFF
+            var b = p and 0xFF
+
+            if (vignette > 0f) {
+                val x = (i % width) - cx
+                val y = (i / width) - cy
+                val d = kotlin.math.sqrt(x * x + y * y) / maxRadius
+                val fall = 1f - vignette * smoothstep(0.25f, 1.15f, d)
+                r = (r * fall).toInt().coerceIn(0, 255)
+                g = (g * fall).toInt().coerceIn(0, 255)
+                b = (b * fall).toInt().coerceIn(0, 255)
+            }
+            if (grain > 0f) {
+                val n = (noiseAt(i, seed) * grain * 14f).toInt()
+                r = (r + n).coerceIn(0, 255)
+                g = (g + n).coerceIn(0, 255)
+                b = (b + n).coerceIn(0, 255)
+            }
+            graded[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
         return Bitmap.createBitmap(graded, width, height, Bitmap.Config.ARGB_8888)
+    }
+
+    private fun smoothstep(edge0: Float, edge1: Float, x: Float): Float {
+        val t = ((x - edge0) / (edge1 - edge0)).coerceIn(0f, 1f)
+        return t * t * (3f - 2f * t)
+    }
+
+    private fun noiseAt(index: Int, seed: Int): Float {
+        var x = index + seed * 0x9E3779B9.toInt()
+        x = x xor (x ushr 16)
+        x *= 0x7FEB352D
+        x = x xor (x ushr 15)
+        x *= 0x846CA68B.toInt()
+        x = x xor (x ushr 16)
+        return (x and 0xFFFF) / 65535f * 2f - 1f
     }
 
     private fun set2DParams() {
@@ -221,15 +299,37 @@ class LutGlProcessor {
             uniform sampler2D uImage;
             uniform sampler3D uLut;
             uniform float uStrength;
+            uniform float uGrain;
+            uniform float uVignette;
+            uniform float uSeed;
             out vec4 outColor;
             const float LUT_SIZE = %LUT_SIZE%.0;
+
+            float hash(vec2 p) {
+                p = fract(p * vec2(123.34, 456.21));
+                p += dot(p, p + 45.32);
+                return fract(p.x * p.y);
+            }
+
             void main() {
                 vec4 src = texture(uImage, vTexCoord);
                 vec3 c = clamp(src.rgb, 0.0, 1.0);
                 // 采样点对齐到 LUT texel 中心，避免半格偏移
                 vec3 coord = (c * (LUT_SIZE - 1.0) + 0.5) / LUT_SIZE;
                 vec3 graded = texture(uLut, coord).rgb;
-                outColor = vec4(mix(src.rgb, graded, uStrength), src.a);
+                vec3 rgb = mix(src.rgb, graded, uStrength);
+
+                if (uGrain > 0.0) {
+                    float n = hash(gl_FragCoord.xy + uSeed) - 0.5;
+                    rgb += n * uGrain * 0.22;
+                }
+                if (uVignette > 0.0) {
+                    vec2 d = (vTexCoord - vec2(0.5)) / vec2(0.5);
+                    float r = length(d) / 1.41421356;
+                    float fall = 1.0 - uVignette * smoothstep(0.25, 1.15, r);
+                    rgb *= fall;
+                }
+                outColor = vec4(clamp(rgb, 0.0, 1.0), src.a);
             }
         """.trimIndent()
     }

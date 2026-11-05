@@ -12,8 +12,8 @@ android {
         // M1 使用 MediaStore RELATIVE_PATH / IS_PENDING，minSdk 取 29 可省去兼容分支
         minSdk = 29
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0-m1"
+        versionCode = 4
+        versionName = "0.4.0-m4"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
@@ -63,11 +63,11 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     debugImplementation("androidx.compose.ui:ui-tooling")
 
-    // CameraX：M1 仅 JDK/JPEG 采集，RAW 在 M2 接入
-    implementation("androidx.camera:camera-core:1.3.4")
-    implementation("androidx.camera:camera-camera2:1.3.4")
-    implementation("androidx.camera:camera-lifecycle:1.3.4")
-    implementation("androidx.camera:camera-view:1.3.4")
+    // CameraX：1.4 起 ImageCapture 支持 RAW / RAW_JPEG 输出
+    implementation("androidx.camera:camera-core:1.4.0")
+    implementation("androidx.camera:camera-camera2:1.4.0")
+    implementation("androidx.camera:camera-lifecycle:1.4.0")
+    implementation("androidx.camera:camera-view:1.4.0")
 
     implementation("androidx.exifinterface:exifinterface:1.3.7")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
