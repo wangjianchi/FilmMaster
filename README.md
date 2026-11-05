@@ -39,6 +39,23 @@ APK 输出：`app/build/outputs/apk/debug/app-debug.apk`
 
 首次启动会请求 `CAMERA` 权限；授予后取景生效。拍摄后照片写入相册，底部会出现最近一张缩略图。
 
+## CI 自动构建与发布
+
+工作流：`.github/workflows/android.yml`
+
+- push / PR 到 `master`：运行单元测试 + 构建 debug APK，产物作为 Actions Artifact 保留 30 天
+- push `v*` 标签：构建并自动创建 GitHub Release，附带 APK
+- Actions 页面可手动触发（`workflow_dispatch`）
+
+发布新版本：
+
+```bash
+git tag v1.0-snapshot
+git push origin v1.0-snapshot
+```
+
+Release 页面即可下载 APK。注意：CI 每次运行生成的 debug keystore 不同，跨 run 覆盖安装会因签名不一致失败，升级前先卸载旧版；若要固定签名，需要额外配置 release keystore secrets 并改用 `assembleRelease`。
+
 ## 架构简述（M1）
 
 ```
