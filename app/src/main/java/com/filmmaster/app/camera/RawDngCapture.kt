@@ -132,7 +132,12 @@ class RawDngCapture(private val context: Context) {
                 val dng = DngCreator(characteristics, finalResult)
                 val orientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
                 dng.setOrientation(
-                    if (orientation == 90) ExifInterface.ORIENTATION_ROTATE_90 else orientation
+                    when (orientation) {
+                        90 -> ExifInterface.ORIENTATION_ROTATE_90
+                        180 -> ExifInterface.ORIENTATION_ROTATE_180
+                        270 -> ExifInterface.ORIENTATION_ROTATE_270
+                        else -> ExifInterface.ORIENTATION_NORMAL
+                    }
                 )
                 val temp = File(context.cacheDir, "raw_${System.currentTimeMillis()}.dng")
                 FileOutputStream(temp).use { out -> dng.writeImage(out, raw) }
