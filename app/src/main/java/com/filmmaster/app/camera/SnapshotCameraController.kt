@@ -23,11 +23,13 @@ import java.io.File
 import java.util.concurrent.TimeUnit
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withContext
 
 /**
  * 抓拍模式相机控制器（CameraX + Camera2Interop）。
@@ -66,8 +68,15 @@ class SnapshotCameraController(
 
     private var snapshotEnabled = false
 
-    /** 期望快门（纳秒），默认 1/125s。 */
+    /** 快门候选（分母），从快到慢；在保证不欠曝的前提下选最快的一个。 */
+    private val shutterCandidates = intArrayOf(125, 100, 80, 60, 50, 40, 30, 25, 20)
+
+    /** 期望快门上界（纳秒），默认 1/125s；实际会按场景亮度自动放慢。 */
     private var targetExposureNs = 1_000_000_000L / 125
+
+    /** 已应用到 capture use case 的曝光，用于判断是否需要重绑。 */
+    @Volatile private var appliedShutterNs = 0L
+    @Volatile private var appliedIso = 0
 
     /** 用户手动指定 ISO；null 表示自动换算。 */
     private var isoOverride: Int? = null
@@ -159,13 +168,16 @@ class SnapshotCameraController(
     /** 顺序连拍 [count] 张，返回实际落盘的临时 JPEG 列表（至少 1 张）。 */
     suspend fun captureBurst(count: Int = 4): List<File> {
         val capture = imageCapture ?: throw IllegalStateException("相机尚未就绪")
+        // 按当前场景重新测光并调整快门/ISO，避免用启用模式那一刻的旧值拍暗
+        applyExposureIfNeeded()
+        val activeCapture = imageCapture ?: capture
         focusAndWait()
 
         val files = ArrayList<File>(count)
         var lastError: Throwable? = null
         repeat(count) { index ->
             try {
-                files += takePictureOnce(capture, index)
+                files += takePictureOnce(activeCapture, index)
             } catch (t: Throwable) {
                 lastError = t
             }
@@ -183,13 +195,17 @@ class SnapshotCameraController(
     }
 
     private fun bindUseCases(cameraProvider: ProcessCameraProvider) {
-        val (exposureNs, iso, degraded) = computeFixedExposure()
+        readCharacteristics(cameraProvider)
+        val (exposureNs, iso, degraded) = computeTargetExposure()
 
         val captureBuilder = ImageCapture.Builder()
             .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+            .setJpegQuality(100)
             .setTargetRotation(Surface.ROTATION_0)
 
         if (snapshotEnabled) {
+            // 限制单帧尺寸：4 张全分辨率 ARGB 解码在手机上容易 OOM，且合成上限就是 2048
+            captureBuilder.setTargetResolution(android.util.Size(2048, 1536))
             Camera2Interop.Extender(captureBuilder)
                 .setCaptureRequestOption(
                     CaptureRequest.CONTROL_AE_MODE,
@@ -215,8 +231,8 @@ class SnapshotCameraController(
             capture
         )
         imageCapture = capture
-
-        camera?.let { readCharacteristics(it) }
+        appliedShutterNs = exposureNs
+        appliedIso = iso
 
         _readout.value = ExposureReadout(
             shutterNs = if (snapshotEnabled) exposureNs else _readout.value.shutterNs,
@@ -226,39 +242,68 @@ class SnapshotCameraController(
         )
     }
 
-    private fun computeFixedExposure(): Triple<Long, Int, Boolean> {
-        val range = exposureRange
-        var degraded = false
-        var exposureNs = targetExposureNs
-        if (range != null && exposureNs < range.lower) {
-            exposureNs = range.lower
-            degraded = true
-        } else if (range != null && exposureNs > range.upper) {
-            exposureNs = range.upper
+    /**
+     * 在“不欠曝”的前提下选最快的快门：用预览 AE 的 EV（曝光量）反推各快门所需 ISO，
+     * 取第一个 ISO 不触顶的档位。全都不够时才牺牲曝光（标记 degraded）。
+     */
+    private fun computeTargetExposure(): Triple<Long, Int, Boolean> {
+        val minIso = maxOf(MIN_ISO, isoRange?.lower ?: MIN_ISO)
+        val maxIso = minOf(MAX_AUTO_ISO, isoRange?.upper ?: MAX_AUTO_ISO)
+
+        isoOverride?.let {
+            return Triple(clampExposure(targetExposureNs), it.coerceIn(minIso, maxIso), false)
         }
 
         val aeIso = latestAeIso
         val aeExp = latestAeExposureNs
-        var iso = isoOverride ?: when {
-            aeIso != null && aeExp != null && aeExp > 0 ->
-                (aeIso.toDouble() * aeExp / exposureNs).toInt()
-            else -> 3200
+        if (aeIso == null || aeExp == null || aeExp <= 0) {
+            // 还没拿到预览 AE 结果：用保守值，标记降级
+            return Triple(clampExposure(1_000_000_000L / 60), 3200.coerceIn(minIso, maxIso), true)
         }
 
-        isoRange?.let { iso = iso.coerceIn(it.lower, it.upper) }
-        iso = iso.coerceIn(MIN_ISO, MAX_AUTO_ISO)
+        val ev = aeIso.toDouble() * aeExp
+        for (denominator in shutterCandidates) {
+            val ns = clampExposure(1_000_000_000L / denominator)
+            val neededIso = (ev / ns).toInt()
+            if (neededIso <= maxIso) {
+                return Triple(ns, neededIso.coerceIn(minIso, maxIso), neededIso >= maxIso)
+            }
+        }
 
-        if (iso >= MAX_AUTO_ISO) degraded = true
-        return Triple(exposureNs, iso, degraded)
+        // 即使最慢快门也要超过 ISO 上限 → 欠曝，取最慢快门 + 最高 ISO
+        val slowest = clampExposure(1_000_000_000L / shutterCandidates.last())
+        return Triple(slowest, maxIso, true)
     }
 
-    private fun readCharacteristics(camera: Camera) {
+    private fun clampExposure(ns: Long): Long {
+        val range = exposureRange ?: return ns
+        return ns.coerceIn(range.lower, range.upper)
+    }
+
+    /** 拍摄前按当前场景刷新曝光；只有值变化时才重绑，代价约一帧。 */
+    private suspend fun applyExposureIfNeeded() {
+        if (!snapshotEnabled) return
+        val cameraProvider = provider ?: return
+        val (ns, iso, _) = computeTargetExposure()
+        if (ns == appliedShutterNs && iso == appliedIso) return
+        withContext(Dispatchers.Main) {
+            runCatching { bindUseCases(cameraProvider) }
+        }
+        delay(80)
+    }
+
+    private fun readCharacteristics(cameraProvider: ProcessCameraProvider) {
         runCatching {
-            val info = Camera2CameraInfo.from(camera.cameraInfo)
-            exposureRange = info.getCameraCharacteristic(
+            val info = cameraProvider.availableCameraInfos.firstOrNull {
+                Camera2CameraInfo.from(it).getCameraCharacteristic(
+                    CameraCharacteristics.LENS_FACING
+                ) == CameraCharacteristics.LENS_FACING_BACK
+            } ?: return
+            val camera2Info = Camera2CameraInfo.from(info)
+            exposureRange = camera2Info.getCameraCharacteristic(
                 CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE
             )
-            isoRange = info.getCameraCharacteristic(
+            isoRange = camera2Info.getCameraCharacteristic(
                 CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE
             )
         }

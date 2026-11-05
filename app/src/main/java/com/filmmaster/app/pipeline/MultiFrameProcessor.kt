@@ -19,13 +19,14 @@ import kotlinx.coroutines.coroutineScope
  * → 现有 ColorPipeline。
  *
  * 对齐：在 1/8 缩略图上做 ±6 像素的穷举 SAD 搜索，得到全局平移量后回投到工作分辨率。
- * 合成：逐像素逐通道取中值（对运动物体与热噪点有天然抑制），按行分块并行。
+ * 合成：逐像素逐通道取中值，但只把中值与参考帧的差值限制在 ±[DETAIL_KEEP] 内——
+ * 保留参考帧的高频（文字/纹理边缘），同时压掉各帧不一致的噪点，避免四点中值把细节抹平。
+ * 按行分块并行。
  *
- * 限制：只补偿平移（不处理旋转/视差）；工作分辨率默认限制在 1600px 长边以控制内存，
- * 因此输出不是全分辨率，后续可换成 GL 分块实现。
+ * 限制：只补偿平移（不处理旋转/视差）；工作分辨率默认限制在 2048px 长边以控制内存。
  */
 class MultiFrameProcessor(
-    private val maxDimension: Int = 1600,
+    private val maxDimension: Int = 2048,
     private val searchRadius: Int = 6,
     private val thumbDivisor: Int = 8
 ) {
@@ -162,6 +163,8 @@ class MultiFrameProcessor(
                 frame.getPixels(it, 0, width, 0, 0, width, height)
             }
         }
+        // 参考帧（对齐后的第一帧）用于细节保留
+        val reference = buffers.first()
         val output = IntArray(width * height)
         val chunkRows = 64
 
@@ -186,10 +189,23 @@ class MultiFrameProcessor(
                         sortSmall(g)
                         sortSmall(b)
                         val mid = count / 2
-                        val rr = if (count % 2 == 0) (r[mid - 1] + r[mid]) / 2 else r[mid]
-                        val gg = if (count % 2 == 0) (g[mid - 1] + g[mid]) / 2 else g[mid]
-                        val bb = if (count % 2 == 0) (b[mid - 1] + b[mid]) / 2 else b[mid]
-                        output[p] = (0xFF shl 24) or (rr shl 16) or (gg shl 8) or bb
+                        var rr = if (count % 2 == 0) (r[mid - 1] + r[mid]) / 2 else r[mid]
+                        var gg = if (count % 2 == 0) (g[mid - 1] + g[mid]) / 2 else g[mid]
+                        var bb = if (count % 2 == 0) (b[mid - 1] + b[mid]) / 2 else b[mid]
+
+                        // 细节保留：中值只允许修正参考帧 ±DETAIL_KEEP 的偏差
+                        val ref = reference[p]
+                        rr += (((ref shr 16) and 0xFF) - rr)
+                            .coerceIn(-DETAIL_KEEP, DETAIL_KEEP)
+                        gg += (((ref shr 8) and 0xFF) - gg)
+                            .coerceIn(-DETAIL_KEEP, DETAIL_KEEP)
+                        bb += ((ref and 0xFF) - bb)
+                            .coerceIn(-DETAIL_KEEP, DETAIL_KEEP)
+
+                        output[p] = (0xFF shl 24) or
+                            (rr.coerceIn(0, 255) shl 16) or
+                            (gg.coerceIn(0, 255) shl 8) or
+                            bb.coerceIn(0, 255)
                     }
                 }
             }
@@ -209,5 +225,10 @@ class MultiFrameProcessor(
             }
             values[j + 1] = v
         }
+    }
+
+    private companion object {
+        /** 允许中值修正参考帧的最大码值差，超过即认为是真实细节而非噪点。 */
+        const val DETAIL_KEEP = 12
     }
 }

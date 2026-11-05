@@ -35,7 +35,7 @@ class SnapshotColorPipeline(
     }
 
     companion object {
-        const val DEFAULT_SHARPNESS = 0.45f
-        const val DEFAULT_CLARITY = 0.35f
+        const val DEFAULT_SHARPNESS = 0.30f
+        const val DEFAULT_CLARITY = 0.18f
     }
 }

@@ -1,6 +1,7 @@
 package com.filmmaster.app.pipeline
 
 import android.graphics.Bitmap
+import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
@@ -15,7 +16,8 @@ import kotlin.math.min
  */
 class FrameEnhancer(
     private val usmRadius: Int = 2,
-    private val maxGain: Float = 2.2f
+    private val maxGain: Float = 1.6f,
+    private val minGain: Float = 0.85f
 ) {
 
     fun enhance(
@@ -47,11 +49,14 @@ class FrameEnhancer(
         val out = IntArray(width * height)
         for (i in pixels.indices) {
             val base = max(luma[i], 0.5f)
-            var detail = (luma[i] - blurSmall[i]) * sharpness
+            val edge = abs(luma[i] - blurSmall[i])
+            // 噪声门限：只强化真正的边缘，避免把弱光噪点/JPEG 块效应一起放大
+            val gate = edge / (edge + 3f)
+            var detail = (luma[i] - blurSmall[i]) * sharpness * gate
             if (blurLarge != null) {
                 detail += (luma[i] - blurLarge[i]) * clarity
             }
-            val gain = ((luma[i] + detail) / base).coerceIn(0.4f, maxGain)
+            val gain = ((luma[i] + detail) / base).coerceIn(minGain, maxGain)
 
             var r = ((pixels[i] shr 16) and 0xFF) * gain
             var g = ((pixels[i] shr 8) and 0xFF) * gain
